@@ -285,15 +285,17 @@ pub const Window = struct {
             break :deco deco;
         };
 
-        if (apprt_window.isQuickTerminal()) {
-            _ = gdk.Surface.signals.enter_monitor.connect(
-                gdk_surface,
-                *ApprtWindow,
-                enteredMonitor,
-                apprt_window,
-                .{},
-            );
-        }
+        // Connect to enter_monitor to handle monitor changes.
+        // Quick terminals need to resize based on the new monitor dimensions.
+        // Regular windows need to reset their default size so GTK re-evaluates
+        // the window's size constraints based on the new monitor's bounds.
+        _ = gdk.Surface.signals.enter_monitor.connect(
+            gdk_surface,
+            *ApprtWindow,
+            if (apprt_window.isQuickTerminal()) enteredMonitorQuickTerminal else enteredMonitorRegular,
+            apprt_window,
+            .{},
+        );
 
         return .{
             .apprt_window = apprt_window,
@@ -478,7 +480,7 @@ pub const Window = struct {
     }
 
     /// Update the size of the quick terminal based on monitor dimensions.
-    fn enteredMonitor(
+    fn enteredMonitorQuickTerminal(
         _: *gdk.Surface,
         monitor: *gdk.Monitor,
         apprt_window: *ApprtWindow,
@@ -498,6 +500,22 @@ pub const Window = struct {
         );
 
         window.setDefaultSize(@intCast(dims.width), @intCast(dims.height));
+    }
+
+    /// Reset the default size for regular windows when entering a new monitor.
+    /// This allows GTK to re-evaluate the window's size constraints based on
+    /// the new monitor's bounds, fixing the issue where a window opened on a
+    /// smaller monitor couldn't be resized larger after being dragged to a
+    /// bigger monitor.
+    fn enteredMonitorRegular(
+        _: *gdk.Surface,
+        _: *gdk.Monitor,
+        apprt_window: *ApprtWindow,
+    ) callconv(.c) void {
+        const window = apprt_window.as(gtk.Window);
+        // Setting default size to -1, -1 tells GTK to forget any cached
+        // size preferences and re-evaluate based on content and monitor bounds.
+        window.setDefaultSize(-1, -1);
     }
 
     fn onActivationTokenEvent(

@@ -194,11 +194,35 @@ pub const Window = struct {
             surface,
         ) orelse return error.NotX11Surface;
 
+        // Connect to enter_monitor to reset size constraints when the window
+        // moves to a different monitor. This fixes the issue where a window
+        // opened on a smaller monitor couldn't be resized larger after being
+        // dragged to a bigger monitor.
+        _ = gdk.Surface.signals.enter_monitor.connect(
+            surface,
+            *ApprtWindow,
+            enteredMonitor,
+            apprt_window,
+            .{},
+        );
+
         return .{
             .app = app,
             .apprt_window = apprt_window,
             .x11_surface = x11_surface,
         };
+    }
+
+    /// Reset the default size when entering a new monitor.
+    /// This allows GTK to re-evaluate the window's size constraints based on
+    /// the new monitor's bounds.
+    fn enteredMonitor(
+        _: *gdk.Surface,
+        _: *gdk.Monitor,
+        apprt_window: *ApprtWindow,
+    ) callconv(.c) void {
+        const window = apprt_window.as(gtk.Window);
+        window.setDefaultSize(-1, -1);
     }
 
     pub fn deinit(self: Window, alloc: Allocator) void {
