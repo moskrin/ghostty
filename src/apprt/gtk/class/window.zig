@@ -490,8 +490,9 @@ pub const Window = extern struct {
         assert(goto >= 0);
         assert(goto < total);
 
-        // If our target is the same as our current then we do nothing.
-        if (goto == current) return false;
+        // If our target is the same as our current then we do nothing,
+        // but still return true to indicate the key was handled.
+        if (goto == current) return true;
 
         // Add the page and select it
         const page = tab_view.getNthPage(goto);
