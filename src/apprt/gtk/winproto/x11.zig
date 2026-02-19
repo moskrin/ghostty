@@ -22,6 +22,27 @@ const ApprtWindow = @import("../class/window.zig").Window;
 
 const log = std.log.scoped(.gtk_x11);
 
+// External C functions for overriding GTK's compute-size bounds clamping.
+const GCallback = *const fn () callconv(.c) void;
+extern fn g_signal_connect_data(
+    instance: *anyopaque,
+    detailed_signal: [*:0]const u8,
+    c_handler: GCallback,
+    data: ?*anyopaque,
+    destroy_data: ?GCallback,
+    connect_flags: c_uint,
+) c_ulong;
+extern fn gdk_toplevel_size_get_bounds(
+    size: *anyopaque,
+    bounds_width: *c_int,
+    bounds_height: *c_int,
+) void;
+extern fn gdk_toplevel_size_set_size(
+    size: *anyopaque,
+    width: c_int,
+    height: c_int,
+) void;
+
 pub const App = struct {
     display: *xlib.Display,
     base_event_code: c_int,
@@ -179,6 +200,11 @@ pub const Window = struct {
     last_applied_blur_region: ?Region = null,
     last_applied_decoration_hints: ?MotifWMHints = null,
 
+    /// Current monitor dimensions, updated on enter_monitor. Used by
+    /// computeSizeOverride to detect stale compositor bounds.
+    monitor_width: c_int = 0,
+    monitor_height: c_int = 0,
+
     pub fn init(
         alloc: Allocator,
         app: *App,
@@ -194,16 +220,27 @@ pub const Window = struct {
             surface,
         ) orelse return error.NotX11Surface;
 
-        // Connect to enter_monitor to reset size constraints when the window
-        // moves to a different monitor. This fixes the issue where a window
-        // opened on a smaller monitor couldn't be resized larger after being
-        // dragged to a bigger monitor.
+        // Connect to enter_monitor to trigger a layout re-evaluation when
+        // the window moves to a different monitor, so GTK picks up the new
+        // monitor's size bounds from the compositor.
         _ = gdk.Surface.signals.enter_monitor.connect(
             surface,
             *ApprtWindow,
             enteredMonitor,
             apprt_window,
             .{},
+        );
+
+        // Override GTK's compute-size bounds clamping to prevent window
+        // snap-back on multi-monitor setups. Connected with G_CONNECT_AFTER
+        // so it runs after GTK's own handler.
+        _ = g_signal_connect_data(
+            @ptrCast(surface),
+            "compute-size",
+            @ptrCast(&computeSizeOverride),
+            @ptrCast(apprt_window),
+            null,
+            1, // G_CONNECT_AFTER
         );
 
         return .{
@@ -213,16 +250,48 @@ pub const Window = struct {
         };
     }
 
-    /// Reset the default size when entering a new monitor.
-    /// This allows GTK to re-evaluate the window's size constraints based on
-    /// the new monitor's bounds.
+    /// Trigger a layout re-evaluation when entering a new monitor.
+    /// Also stores the monitor dimensions so computeSizeOverride can
+    /// distinguish stale bounds from accurate ones.
     fn enteredMonitor(
         _: *gdk.Surface,
-        _: *gdk.Monitor,
+        monitor: *gdk.Monitor,
         apprt_window: *ApprtWindow,
     ) callconv(.c) void {
-        const window = apprt_window.as(gtk.Window);
-        window.setDefaultSize(-1, -1);
+        var geo: gdk.Rectangle = undefined;
+        monitor.getGeometry(&geo);
+        const wp = &apprt_window.winproto().x11;
+        wp.monitor_width = geo.f_width;
+        wp.monitor_height = geo.f_height;
+
+        apprt_window.as(gtk.Widget).queueResize();
+    }
+
+    /// Override GTK's compute-size bounds clamping. See the equivalent
+    /// function in wayland.zig for the full explanation.
+    fn computeSizeOverride(
+        _: *anyopaque, // GdkToplevel*
+        size: *anyopaque, // GdkToplevelSize*
+        apprt_window_raw: *anyopaque, // ApprtWindow*
+    ) callconv(.c) void {
+        const apprt_window: *ApprtWindow = @ptrCast(@alignCast(apprt_window_raw));
+        const widget = apprt_window.as(gtk.Widget);
+        const width: c_int = widget.getWidth();
+        const height: c_int = widget.getHeight();
+
+        if (width <= 0 or height <= 0) return;
+
+        var bounds_w: c_int = 0;
+        var bounds_h: c_int = 0;
+        gdk_toplevel_size_get_bounds(size, &bounds_w, &bounds_h);
+
+        const wp = &apprt_window.winproto().x11;
+        const bounds_are_stale = (wp.monitor_width > 0 and wp.monitor_height > 0) and
+            (bounds_w < wp.monitor_width or bounds_h < wp.monitor_height);
+
+        if (bounds_are_stale and (width > bounds_w or height > bounds_h)) {
+            gdk_toplevel_size_set_size(size, width, height);
+        }
     }
 
     pub fn deinit(self: Window, alloc: Allocator) void {

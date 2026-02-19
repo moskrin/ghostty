@@ -19,6 +19,29 @@ const xdg = wayland.client.xdg;
 
 const log = std.log.scoped(.winproto_wayland);
 
+// External C functions for overriding GTK's compute-size bounds clamping.
+// We declare these directly rather than using @cImport to avoid pulling
+// in the full GDK/GLib headers which could conflict with the Zig bindings.
+const GCallback = *const fn () callconv(.c) void;
+extern fn g_signal_connect_data(
+    instance: *anyopaque,
+    detailed_signal: [*:0]const u8,
+    c_handler: GCallback,
+    data: ?*anyopaque,
+    destroy_data: ?GCallback,
+    connect_flags: c_uint,
+) c_ulong;
+extern fn gdk_toplevel_size_get_bounds(
+    size: *anyopaque,
+    bounds_width: *c_int,
+    bounds_height: *c_int,
+) void;
+extern fn gdk_toplevel_size_set_size(
+    size: *anyopaque,
+    width: c_int,
+    height: c_int,
+) void;
+
 /// Wayland state that contains application-wide Wayland objects (e.g. wl_display).
 pub const App = struct {
     display: *wl.Display,
@@ -248,6 +271,11 @@ pub const Window = struct {
     /// requesting attention from the user.
     activation_token: ?*xdg.ActivationTokenV1 = null,
 
+    /// Current monitor dimensions, updated on enter_monitor. Used by
+    /// computeSizeOverride to detect stale compositor bounds.
+    monitor_width: c_int = 0,
+    monitor_height: c_int = 0,
+
     pub fn init(
         alloc: Allocator,
         app: *App,
@@ -287,8 +315,8 @@ pub const Window = struct {
 
         // Connect to enter_monitor to handle monitor changes.
         // Quick terminals need to resize based on the new monitor dimensions.
-        // Regular windows need to reset their default size so GTK re-evaluates
-        // the window's size constraints based on the new monitor's bounds.
+        // Regular windows trigger a layout re-evaluation so GTK picks up
+        // the new monitor's size bounds from the compositor.
         _ = gdk.Surface.signals.enter_monitor.connect(
             gdk_surface,
             *ApprtWindow,
@@ -296,6 +324,23 @@ pub const Window = struct {
             apprt_window,
             .{},
         );
+
+        // For regular windows, override GTK's compute-size bounds clamping.
+        // On KDE Plasma Wayland, the compositor may send stale
+        // configure_bounds from the original monitor after the window is
+        // resized on a larger monitor. GTK clamps to those bounds, causing
+        // the window to snap back. We connect after GTK's own handler
+        // (G_CONNECT_AFTER=1) so we can override the clamped size.
+        if (!apprt_window.isQuickTerminal()) {
+            _ = g_signal_connect_data(
+                @ptrCast(gdk_surface),
+                "compute-size",
+                @ptrCast(&computeSizeOverride),
+                @ptrCast(apprt_window),
+                null,
+                1, // G_CONNECT_AFTER
+            );
+        }
 
         return .{
             .apprt_window = apprt_window,
@@ -502,20 +547,66 @@ pub const Window = struct {
         window.setDefaultSize(@intCast(dims.width), @intCast(dims.height));
     }
 
-    /// Reset the default size for regular windows when entering a new monitor.
-    /// This allows GTK to re-evaluate the window's size constraints based on
-    /// the new monitor's bounds, fixing the issue where a window opened on a
-    /// smaller monitor couldn't be resized larger after being dragged to a
-    /// bigger monitor.
+    /// Trigger a layout re-evaluation for regular windows when entering a new
+    /// monitor. Also stores the monitor dimensions so computeSizeOverride can
+    /// distinguish stale bounds from accurate ones.
     fn enteredMonitorRegular(
         _: *gdk.Surface,
-        _: *gdk.Monitor,
+        monitor: *gdk.Monitor,
         apprt_window: *ApprtWindow,
     ) callconv(.c) void {
-        const window = apprt_window.as(gtk.Window);
-        // Setting default size to -1, -1 tells GTK to forget any cached
-        // size preferences and re-evaluate based on content and monitor bounds.
-        window.setDefaultSize(-1, -1);
+        // Store the current monitor dimensions for computeSizeOverride.
+        var geo: gdk.Rectangle = undefined;
+        monitor.getGeometry(&geo);
+        const wp = &apprt_window.winproto().wayland;
+        wp.monitor_width = geo.f_width;
+        wp.monitor_height = geo.f_height;
+
+        apprt_window.as(gtk.Widget).queueResize();
+    }
+
+    /// Override GTK's compute-size bounds clamping to prevent window
+    /// snap-back on multi-monitor setups. On KDE Plasma Wayland, the
+    /// compositor sends stale configure_bounds from the original monitor
+    /// after an interactive resize ends on a different (larger) monitor.
+    /// GTK clamps the window size to those stale bounds, snapping the
+    /// window back to the smaller monitor's dimensions.
+    ///
+    /// This handler runs after GTK's own compute-size handler
+    /// (connected with G_CONNECT_AFTER). It compares the compositor's
+    /// reported bounds against the actual current monitor dimensions
+    /// (stored by enteredMonitorRegular). If bounds are stale (smaller
+    /// than the current monitor), it overrides with the current window
+    /// size. If bounds match the current monitor (window moved to a
+    /// smaller screen), it lets GTK clamp normally so the window fits.
+    fn computeSizeOverride(
+        _: *anyopaque, // GdkToplevel*
+        size: *anyopaque, // GdkToplevelSize*
+        apprt_window_raw: *anyopaque, // ApprtWindow*
+    ) callconv(.c) void {
+        const apprt_window: *ApprtWindow = @ptrCast(@alignCast(apprt_window_raw));
+        const widget = apprt_window.as(gtk.Widget);
+        const width: c_int = widget.getWidth();
+        const height: c_int = widget.getHeight();
+
+        // During initial window setup width/height are 0; let GTK handle it.
+        if (width <= 0 or height <= 0) return;
+
+        var bounds_w: c_int = 0;
+        var bounds_h: c_int = 0;
+        gdk_toplevel_size_get_bounds(size, &bounds_w, &bounds_h);
+
+        // Only override if the window exceeds the bounds AND the bounds
+        // are stale (smaller than the actual current monitor). If the
+        // bounds match the current monitor, the window genuinely moved
+        // to a smaller screen and should be clamped to fit.
+        const wp = &apprt_window.winproto().wayland;
+        const bounds_are_stale = (wp.monitor_width > 0 and wp.monitor_height > 0) and
+            (bounds_w < wp.monitor_width or bounds_h < wp.monitor_height);
+
+        if (bounds_are_stale and (width > bounds_w or height > bounds_h)) {
+            gdk_toplevel_size_set_size(size, width, height);
+        }
     }
 
     fn onActivationTokenEvent(
