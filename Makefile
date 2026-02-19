@@ -1,6 +1,14 @@
-init:
-	@echo You probably want to run "zig build" instead.
-.PHONY: init
+all:
+	zig build
+.PHONY: all
+
+release:
+	zig build -Doptimize=ReleaseFast
+.PHONY: release
+
+install:
+	zig build install -Doptimize=ReleaseFast --prefix /usr
+.PHONY: install
 
 # glad updates the GLAD loader. To use this, place the generated glad.zip
 # in this directory next to the Makefile, remove vendor/glad and run this target.
