@@ -3469,9 +3469,10 @@ pub fn scrollCallback(
 
         // If we're in alternate screen with alternate scroll enabled, then
         // we convert to cursor keys. This only happens if we're:
-        // (1) alt screen (2) no explicit mouse reporting and (3) alt
-        // scroll mode enabled.
-        if (self.io.terminal.screens.active_key == .alternate and
+        // (1) mouse reporting allowed by config (2) alt screen
+        // (3) no explicit mouse reporting and (4) alt scroll mode enabled.
+        if (self.config.mouse_reporting and
+            self.io.terminal.screens.active_key == .alternate and
             self.io.terminal.flags.mouse_event == .none and
             self.io.terminal.modes.get(.mouse_alternate_scroll))
         {
